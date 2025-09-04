@@ -131,12 +131,10 @@ export function useTranscriptDataChannel(room: Room | null, inputLanguage?: stri
     setTranscripts([]);
   }, []);
 
-  // Merge helper for segment-based transcripts by participant+timestamp
+  // Merge helper for segment-based transcripts by participant only
   const upsertSegmentedEntry = useCallback((incoming: TranscriptEntry) => {
     setTranscripts(prev => {
-      const byKey = (e: TranscriptEntry) => `${e.participantIdentity}-${e.timestamp}`;
-      const key = byKey(incoming);
-      const idx = prev.findIndex(e => byKey(e) === key);
+      const idx = prev.findIndex(e => e.participantIdentity === incoming.participantIdentity);
 
       if (idx === -1) {
         // Build text from segments if provided
@@ -162,19 +160,78 @@ export function useTranscriptDataChannel(room: Room | null, inputLanguage?: stri
       next.seq = incoming.seq ?? current.seq;
       next.isFinal = incoming.isFinal ?? current.isFinal;
       next.language = incoming.language ?? current.language;
+      // preserve existing timestamp to avoid regrouping
+      next.timestamp = current.timestamp;
 
       if (incoming.segments && incoming.segments.length > 0) {
         const existingSegments: TranscriptSegment[] = Array.isArray(current.segments) ? [...current.segments] : [];
-        const mergedMap = new Map<string, TranscriptSegment>();
-        const segKey = (s: TranscriptSegment) => `${s.start}-${s.end}`;
-        for (const s of existingSegments) mergedMap.set(segKey(s), s);
-        for (const s of incoming.segments) mergedMap.set(segKey(s), s); // upsert incoming
-        const merged = Array.from(mergedMap.values()).sort((a, b) => a.start - b.start || a.end - b.end);
-        next.segments = merged;
-        next.text = merged.map(s => s.text).join(' ').trim();
-        // If any segment not completed, mark not final unless explicitly final
+        const incomingSegments: TranscriptSegment[] = [...incoming.segments].sort((a, b) => a.start - b.start || a.end - b.end);
+
+        const removeOverlaps = (base: TranscriptSegment[], seg: TranscriptSegment): TranscriptSegment[] => {
+          return base.filter(s => (s.end <= seg.start) || (s.start >= seg.end));
+        };
+
+        let merged: TranscriptSegment[] = [];
+        const firstIncoming = incomingSegments[0];
+        const existingSorted = [...existingSegments].sort((a, b) => a.start - b.start || a.end - b.end);
+
+        if (firstIncoming) {
+          const existingFirstText = existingSorted[0]?.text;
+          const compareTarget = existingFirstText ?? current.text;
+          const firstMatches = firstIncoming.text === compareTarget;
+
+          if (firstIncoming.completed && firstMatches) {
+            const base: TranscriptSegment[] = existingSorted.length > 0 ? [existingSorted[0]] : [];
+            const preservedEnd = base.length > 0 ? base[0].end : -Infinity;
+            const tail = incomingSegments.slice(1).filter(s => s.start >= preservedEnd);
+            merged = [...base];
+            for (const seg of tail) {
+              merged = removeOverlaps(merged, seg);
+              merged.push(seg);
+            }
+          } else if (firstIncoming.completed && !firstMatches) {
+            const firstIncompleteIdx = existingSorted.findIndex(s => !s.completed);
+            const cutIdx = firstIncompleteIdx === -1 ? existingSorted.length : firstIncompleteIdx;
+            const base = existingSorted.slice(0, cutIdx);
+            const preservedEnd = base.length > 0 ? base[base.length - 1].end : -Infinity;
+            const add = incomingSegments.filter(s => s.start >= preservedEnd);
+            merged = [...base, ...add];
+          } else if (!firstIncoming.completed) {
+            const firstIncompleteIdx = existingSorted.findIndex(s => !s.completed);
+            const cutIdx = firstIncompleteIdx === -1 ? existingSorted.length : firstIncompleteIdx;
+            const base = existingSorted.slice(0, cutIdx);
+            const preservedEnd = base.length > 0 ? base[base.length - 1].end : -Infinity;
+            const add = incomingSegments.filter(s => s.start >= preservedEnd);
+            merged = [...base, ...add];
+          } else {
+            // Fallback: overlay by removing overlaps, keep earlier non-overlapping existing
+            merged = [...existingSorted];
+            for (const seg of incomingSegments) {
+              merged = removeOverlaps(merged, seg);
+              merged.push(seg);
+              merged.sort((a, b) => a.start - b.start || a.end - b.end);
+            }
+          }
+        } else {
+          merged = existingSorted;
+        }
+
+        // Normalize: collapse consecutive duplicates by same text+completed, and coalesce time ranges
+        const normalized: TranscriptSegment[] = [];
+        for (const s of merged) {
+          const last = normalized[normalized.length - 1];
+          if (last && last.text === s.text && last.completed === s.completed) {
+            // coalesce time window
+            last.start = Math.min(last.start, s.start);
+            last.end = Math.max(last.end, s.end);
+          } else {
+            normalized.push({ ...s });
+          }
+        }
+        next.segments = normalized;
+        next.text = normalized.map(s => s.text).join(' ').replace(/\s+/g, ' ').trim();
         if (incoming.isFinal === undefined) {
-          next.isFinal = merged.every(s => s.completed);
+          next.isFinal = normalized.every(s => s.completed);
         }
       } else if (incoming.text) {
         // No segments provided, just update text
